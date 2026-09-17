@@ -53,8 +53,8 @@ def configuration(local_data: Path | None, port: int | None, env: dict) -> tuple
         raise ValueError("PORT musi miec wartosc od 1 do 65535.")
     argv = ["--host", host, "--port", str(server_port),
             "--db", str(directory / "private_test.sqlite3"),
-            "--speed", env.get("PGR_SPEED", "10"),
-            "--max-players", env.get("PGR_MAX_PLAYERS", "0")]
+            "--speed", env.get("PGR_SPEED", "1"),
+            "--max-players", env.get("PGR_MAX_PLAYERS", "15" if local_data is None else "0")]
     return directory, argv, trusted_header
 
 
@@ -67,7 +67,7 @@ def main() -> int:
     try:
         directory, argv, trusted_header = configuration(args.local_data, args.port, dict(os.environ))
         world_lock = WorldFileLock(directory)
-        print("Alien Colonies: trwaly zapis gotowy; uruchamiam jedna galaktyke.", flush=True)
+        print("Alien Colonies: trwaly zapis gotowy; uruchamiam wspolny wszechswiat (6 galaktyk).", flush=True)
         app.main(argv=argv, trust_proxy_header=trusted_header)
         return 0
     except (OSError, ValueError, RuntimeError) as exc:

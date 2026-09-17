@@ -13,6 +13,11 @@ the caller commits both within its normal world lock/idempotent action handling.
 """
 from __future__ import annotations
 
+try:
+    from .i18n import t, join_text
+except ImportError:  # Flat Railway deployment.
+    from i18n import t, join_text
+
 import copy
 import math
 from functools import lru_cache
@@ -20,6 +25,9 @@ from functools import lru_cache
 
 ROOTS = {race: race + "_root" for race in ("zetans", "automatons", "symbionts")}
 EMPTY_RADIUS = 300
+BASE_COST_DIVISOR = 6
+COST_GROWTH_NUMERATOR = 112
+COST_GROWTH_DENOMINATOR = 100
 BONUS_CAPS = {
     "first_volley": .50, "regeneration": .50, "damage_reduction": .30,
     "production_metal": .60, "production_crystal": .60, "production_fuel": .60,
@@ -145,10 +153,10 @@ BRIDGES = [
 
 
 def _description(effects):
-    result = ". ".join(f"{EFFECT_LABELS[key]} +{round(value * 100)}%"
-                       for key, value in effects.items()) + "."
+    result = join_text(". ", (t("{0} +{1}%").format(t(EFFECT_LABELS[key]), round(value * 100))
+                       for key, value in effects.items())) + "."
     if "swarm_loot" in effects:
-        result += " Do wysokości zapasu i ładowni; zaokrąglane w dół."
+        result += t(' Do wysokości zapasu i ładowni; zaokrąglane w dół.')
     return result
 
 
@@ -161,7 +169,7 @@ def _make_graph():
     nodes, edges = [], []
     root_data = {
         "zetans": ("Przebudzenie Zety", {"first_volley": .35}),
-        "automatons": ("Niezłomny rdzeń", {"damage_reduction": .12}),
+        "automatons": (t('Niezłomny rdzeń'), {"damage_reduction": .12}),
         "symbionts": ("Wieczne odradzanie", {"regeneration": .35}),
     }
     for sector in SECTORS:
@@ -216,7 +224,13 @@ for _a, _b in _GRAPH["edges"]:
 
 def graph():
     """Return an independent, JSON-ready graph; ``size`` is a world-space radius."""
-    return copy.deepcopy(_GRAPH)
+    result = copy.deepcopy(_GRAPH)
+    for node in result["nodes"]:
+        node["name"] = t(node["name"])
+        node["description"] = _description(node["effects"])
+    for sector in result["sectors"]:
+        sector["name"] = t(sector["name"])
+    return result
 
 
 def unlocked_for(race, raw_unlocks):
@@ -260,25 +274,46 @@ def bonuses(race, raw_unlocks):
 
 def _wallet(value):
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError("Nieprawidłowy stan kryształów Roju.")
+        raise ValueError(t('Nieprawidłowy stan kryształów Roju.'))
     return value
+
+
+@lru_cache(maxsize=60)
+def _cost_terms(purchased_count):
+    """Exact growth terms; only normalized connected paid skills are counted."""
+    return (COST_GROWTH_NUMERATOR ** purchased_count,
+            COST_GROWTH_DENOMINATOR ** purchased_count)
+
+
+def _purchase_cost(base_cost, purchased_count):
+    """Ceil(base / 6 * 1.12 ** paid_count), without float rounding or drift.
+
+    The initial racial root is free. Every other connected skill, including a
+    foreign racial root, raises prices across the whole wheel. Prices follow
+    the saved unlock list, so they survive reloads without a separate counter.
+    """
+    numerator, denominator = _cost_terms(purchased_count)
+    numerator *= base_cost
+    denominator *= BASE_COST_DIVISOR
+    return (numerator + denominator - 1) // denominator
 
 
 def quote_unlock(race, raw_unlocks, node_id, wallet):
     """Validate one adjacent purchase; raise ``ValueError`` with a UI-safe reason."""
     if not isinstance(race, str) or race not in ROOTS:
-        raise ValueError("Najpierw wybierz rasę swojego imperium.")
+        raise ValueError(t('Najpierw wybierz rasę swojego imperium.'))
     if not isinstance(node_id, str) or node_id not in _NODES:
-        raise ValueError("Nie ma takiej umiejętności.")
+        raise ValueError(t('Nie ma takiej umiejętności.'))
     current = unlocked_for(race, raw_unlocks)
     owned = set(current)
     if node_id in owned:
-        raise ValueError("Ta umiejętność jest już odblokowana.")
+        raise ValueError(t('Ta umiejętność jest już odblokowana.'))
     if not _NEIGHBORS[node_id].intersection(owned):
-        raise ValueError("Najpierw odblokuj sąsiednią umiejętność połączoną ścieżką.")
-    balance, cost = _wallet(wallet), _NODES[node_id]["cost"]
+        raise ValueError(t('Najpierw odblokuj sąsiednią umiejętność połączoną ścieżką.'))
+    balance = _wallet(wallet)
+    cost = _purchase_cost(_NODES[node_id]["cost"], len(current) - 1)
     if balance < cost:
-        raise ValueError(f"Brakuje {cost - balance} kryształów Roju. Zdobądź je, atakując Rój.")
+        raise ValueError(t('Brakuje {0} kryształów Roju. Zdobądź je, atakując Rój.').format(cost - balance))
     return {"node_id": node_id, "cost": cost, "balance_after": balance - cost,
             "unlocks": unlocked_for(race, current + [node_id])}
 
@@ -288,10 +323,21 @@ def public_state(race, raw_unlocks, wallet):
     balance = _wallet(wallet)
     unlocked = unlocked_for(race, raw_unlocks)
     owned = set(unlocked)
+    purchased_count = max(0, len(unlocked) - 1)
+    numerator, denominator = _cost_terms(purchased_count)
     result = graph()
     for node in result["nodes"]:
+        node["base_cost"] = node["cost"]
         node["unlocked"] = node["id"] in owned
+        node["cost"] = 0 if node["unlocked"] else _purchase_cost(node["base_cost"], purchased_count)
         node["available"] = not node["unlocked"] and bool(_NEIGHBORS[node["id"]].intersection(owned))
         node["affordable"] = node["available"] and balance >= node["cost"]
-    result.update(balance=balance, unlocked=unlocked, bonuses=bonuses(race, unlocked))
+    result.update(balance=balance, unlocked=unlocked, bonuses=bonuses(race, unlocked),
+                  purchased_count=purchased_count,
+                  cost_multiplier=round(numerator / denominator, 6),
+                  cost_rule={"base_divisor": BASE_COST_DIVISOR,
+                             "growth_numerator": COST_GROWTH_NUMERATOR,
+                             "growth_denominator": COST_GROWTH_DENOMINATOR,
+                             "rounding": "ceil", "scope": "all_paid_nodes",
+                             "own_root_free": True})
     return result
